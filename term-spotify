@@ -59,7 +59,9 @@ SCOPE    = ("user-read-playback-state "
             "user-modify-playback-state "
             "user-read-currently-playing "
             "user-library-read "
-            "user-read-recently-played")
+            "user-read-recently-played "
+            "playlist-read-private "
+            "playlist-read-collaborative")
 REDIRECT = "http://127.0.0.1:9090/callback"
 
 
@@ -888,6 +890,16 @@ def main():
 
     _log("startup: user_id=%r spotifyd_proc=%s" % (_user_id, _spotifyd_proc and "running" or "None"))
 
+    # Playlist browser state (persists across frames)
+    _pl_cache       = []       # list of {"name": str, "uri": str}
+    _pl_box         = [None]   # background fetch writes here
+    _pl_fetching    = [False]
+    do_playlist     = False
+    _pl_filter      = ""
+    _pl_cursor      = 0
+    _pl_now_name    = ""       # name of currently playing playlist (if known)
+    _pl_now_uri     = ""       # URI of currently playing playlist
+
     old_term = termios.tcgetattr(sys.stdin)
     tty.setraw(sys.stdin.fileno())
     sys.stdout.write("\x1b[?25l")   # hide cursor
@@ -923,6 +935,56 @@ def main():
             do_search = False
             do_recent = False
             for key in keys:
+                if do_playlist:
+                    if key in ("q", "\x03"):
+                        quit_now = True
+                        break
+                    elif key == "\x1b":
+                        do_playlist = False
+                        _pl_filter  = ""
+                        _pl_cursor  = 0
+                    elif key == "\x1b[A":
+                        _pl_cursor = max(0, _pl_cursor - 1)
+                    elif key == "\x1b[B":
+                        _pl_cursor += 1
+                    elif key in ("\r", "\n"):
+                        _pl_vis = [p for p in _pl_cache
+                                   if _pl_filter.lower() in p["name"].lower()]
+                        if _pl_vis and 0 <= _pl_cursor < len(_pl_vis):
+                            chosen = _pl_vis[_pl_cursor]
+                            do_playlist  = False
+                            _pl_filter   = ""
+                            _pl_cursor   = 0
+                            _pl_now_name = chosen["name"]
+                            _pl_now_uri  = chosen["uri"]
+                            sid = _spotifyd_id
+                            if sid:
+                                def _play_pl(uri=chosen["uri"], sid=sid):
+                                    try:
+                                        token = _bearer()
+                                        hdrs = {
+                                            "Authorization": f"Bearer {token}",
+                                            "Content-Type": "application/json",
+                                        }
+                                        body = json.dumps({"context_uri": uri}).encode()
+                                        req = urllib.request.Request(
+                                            f"https://api.spotify.com/v1/me/player/play"
+                                            f"?device_id={sid}",
+                                            data=body, method="PUT", headers=hdrs,
+                                        )
+                                        urllib.request.urlopen(req, timeout=5).close()
+                                    except Exception as e:
+                                        _cmd_box[0] = str(e)[:80]
+                                threading.Thread(target=_play_pl, daemon=True).start()
+                                next_poll = time.time() + 1.5
+                    elif key in ("\x7f", "\x08"):
+                        _pl_filter = _pl_filter[:-1]
+                        _pl_cursor = 0
+                    elif len(key) == 1 and key >= " ":
+                        _pl_filter += key
+                        _pl_cursor = 0
+                    continue
+
                 if key in ("q", "\x03"):
                     quit_now = True
                     break
@@ -993,6 +1055,32 @@ def main():
                     do_search = True
                 elif key == "r":
                     do_recent = True
+                elif key == "p":
+                    do_playlist = True
+                    if not _pl_cache and not _pl_fetching[0]:
+                        _pl_fetching[0] = True
+                        def _fetch_pls(box=_pl_box, fetching=_pl_fetching):
+                            try:
+                                token = _bearer()
+                                pls = []
+                                url = "https://api.spotify.com/v1/me/playlists?limit=50"
+                                while url and len(pls) < 500:
+                                    req = urllib.request.Request(
+                                        url, headers={"Authorization": f"Bearer {token}"},
+                                    )
+                                    with urllib.request.urlopen(req, timeout=5) as resp:
+                                        data = json.loads(resp.read())
+                                    for item in data.get("items", []):
+                                        if item and item.get("name"):
+                                            pls.append({"name": item["name"],
+                                                        "uri":  item["uri"]})
+                                    url = data.get("next")
+                                box[0] = pls
+                            except Exception as e:
+                                _cmd_box[0] = str(e)[:80]
+                            finally:
+                                fetching[0] = False
+                        threading.Thread(target=_fetch_pls, daemon=True).start()
 
             if quit_now:
                 break
@@ -1172,6 +1260,61 @@ def main():
             tick += 1
             term_w, term_h = shutil.get_terminal_size((120, 30))
 
+            # ── drain playlist fetch result ───────────────────────────────────
+            if _pl_box[0] is not None:
+                _pl_cache = _pl_box[0]
+                _pl_box[0] = None
+
+            # ── playlist browser overlay ──────────────────────────────────────
+            if do_playlist:
+                _pl_vis = [p for p in _pl_cache
+                           if _pl_filter.lower() in p["name"].lower()]
+                if _pl_vis:
+                    _pl_cursor = max(0, min(_pl_cursor, len(_pl_vis) - 1))
+                else:
+                    _pl_cursor = 0
+
+                if _pl_filter:
+                    hdr = (f"{BOLD}Playlists{RESET}  "
+                           f"{DIM}filter: {RESET}{_pl_filter}▌")
+                else:
+                    hdr = f"{BOLD}Playlists{RESET}  {DIM}type to filter{RESET}"
+                sep  = DIM + "─" * term_w + RESET
+                foot = (DIM + "↑↓ scroll  "
+                        "type to filter  ⌫ clear  ↵ play  esc/p cancel" + RESET)
+
+                list_h = max(1, term_h - 4)
+
+                if not _pl_vis:
+                    if _pl_fetching[0]:
+                        rows = [f"  {DIM}Loading playlists…{RESET}"]
+                    elif not _pl_cache:
+                        rows = [f"  {DIM}No playlists found.{RESET}"]
+                    else:
+                        rows = [f"  {DIM}No matches.{RESET}"]
+                else:
+                    scroll = max(0, min(_pl_cursor - list_h + 3,
+                                        len(_pl_vis) - list_h))
+                    scroll = max(0, scroll)
+                    rows = []
+                    for i, pl in enumerate(_pl_vis[scroll:scroll + list_h]):
+                        idx  = scroll + i
+                        name = pl["name"]
+                        if idx == _pl_cursor:
+                            rows.append(f"  {GREEN}▶ {BOLD}{name}{RESET}")
+                        else:
+                            rows.append(f"    {DIM}{name}{RESET}")
+
+                pl_out = [hdr, sep, *rows, sep, foot]
+                buf = ["\x1b[H"]
+                for line in pl_out[:-1]:
+                    buf.append(line[:term_w] + "\x1b[K\r\n")
+                buf.append(pl_out[-1][:term_w] + "\x1b[K\x1b[J")
+                sys.stdout.write("".join(buf))
+                sys.stdout.flush()
+                time.sleep(max(0.0, 0.1 - (time.time() - _t0)))
+                continue
+
             # ── nothing playing ───────────────────────────────────────────────
             # Pick up spotifyd device ID once the background thread finds it
             if _spotifyd_id is None and _spotifyd_box[0]:
@@ -1185,7 +1328,7 @@ def main():
                     hint = f"{RED}Spotify rate-limited — clears in {mins}m {secs:02d}s{RESET}"
                 elif _spotifyd_id:
                     vol_hint = f"  ↑↓ = sys vol ({_local_vol}%)" if _local_vol is not None else "  ↑↓ = sys vol"
-                    hint = f"space/l = liked  r = recent  / = search{vol_hint}"
+                    hint = f"space/l = liked  r = recent  / = search  p = playlists{vol_hint}"
                 elif _spotifyd_box[0] is None and _spotifyd_proc:
                     hint = "starting Terminal Player device…"
                 else:
@@ -1215,8 +1358,20 @@ def main():
             art_url  = images[0]["url"] if images else None
             track_id = item.get("id")
 
+            # Sync playlist name from current playback context
+            ctx_uri = (pb.get("context") or {}).get("uri", "")
+            if ctx_uri.startswith("spotify:playlist:"):
+                if ctx_uri != _pl_now_uri:
+                    _pl_now_uri  = ctx_uri
+                    match = next((p for p in _pl_cache if p["uri"] == ctx_uri), None)
+                    _pl_now_name = match["name"] if match else _pl_now_name
+            elif ctx_uri:
+                _pl_now_name = ""
+                _pl_now_uri  = ""
+
             # ── layout dimensions ─────────────────────────────────────────────
-            avail_rows = max(4, term_h - 6)   # 3 header + 3 footer
+            header_h   = 4 if _pl_now_name else 3   # text lines + separator
+            avail_rows = max(4, term_h - header_h - 3)  # -3 for sep+progress+status
             art_cols   = term_w // 2
             eq_cols    = term_w - art_cols
             art_rows   = min(avail_rows, art_cols // 2)
@@ -1299,15 +1454,18 @@ def main():
             if status_ticks > 0: status_ticks -= 1
             else:                status_msg = ""
 
+            pl_line = ([f"{DIM}from playlist: {_pl_now_name}{RESET}"[:term_w]]
+                       if _pl_now_name else [])
             out = [
                 (f"{BOLD}{track}{RESET}  {DIM}{artists}{RESET}")[:term_w],
                 f"{DIM}{album}{RESET}"[:term_w],
+                *pl_line,
                 DIM + "─" * term_w + RESET,
                 *combined,
                 DIM + "─" * term_w + RESET,
                 progress_bar(prog_ms, dur_ms, bar_w),
                 (f"\x1b[31m⚠ {status_msg}{RESET}" if status_msg else
-                 f"{DIM}{state} {device}{vol_s}   {eq_src}   space=⏯  ←=⏮  →=⏭  ↑↓=vol  l=liked  r=recent  /=search  q=quit{RESET}"),
+                 f"{DIM}{state} {device}{vol_s}   {eq_src}   space=⏯  ←=⏮  →=⏭  ↑↓=vol  l=liked  r=recent  /=search  p=playlists  q=quit{RESET}"),
             ]
 
             # Overwrite in place — no clear-screen flash

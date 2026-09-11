@@ -10,6 +10,7 @@ A terminal Spotify player for macOS with colored braille album art, animated EQ 
 - **Animated EQ visualizer** — real-time FFT via BlackHole loopback, falls back to Spotify audio analysis API
 - **System audio integration** — auto-launches Background Music, routes audio through Multi-Output Device (speakers + BlackHole)
 - **CoreAudio volume control** — reads and writes hardware volume directly, bypasses Background Music's software lock
+- **Playlist browser** — press `p` to browse all your playlists, type to filter, arrow keys to scroll, enter to play
 - **Liked songs shuffle** — starts at a random position in your library, not always track #1
 - **Track search** — type a query, plays the top Spotify result
 - **Session resume** — `r` picks up the exact track and position from last time
@@ -99,12 +100,23 @@ On first run you'll be prompted for your Client ID and Secret. A browser tab ope
 | `space` | Play / pause |
 | `l` | Shuffle liked songs (random start position) |
 | `r` | Resume last session (exact track + position) |
+| `p` | Open playlist browser |
 | `/` | Search — type a query, plays top result |
 | `→` | Next track |
 | `←` | Previous track |
 | `↑` / `↓` | System volume ±5% |
 | `+` / `-` | System volume ±5% (alternate) |
 | `q` | Quit |
+
+### Playlist browser
+
+| Key | Action |
+|-----|--------|
+| type | Filter playlists by name |
+| `↑` / `↓` | Scroll through results |
+| `⌫` | Delete filter character |
+| `↵` | Play selected playlist |
+| `esc` | Cancel |
 
 ---
 

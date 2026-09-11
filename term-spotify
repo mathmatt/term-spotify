@@ -1,0 +1,1384 @@
+#!/usr/bin/env python3
+"""
+spotify — Terminal Spotify player with colored braille album art.
+
+Transparent pixels in album art let the terminal background show through.
+
+First-run setup (one time):
+  1. Go to https://developer.spotify.com/dashboard
+  2. Click "Create app" — any name/description
+  3. Add Redirect URI:  http://127.0.0.1:9090/callback
+  4. Check "Web API" → Save → Settings → copy Client ID + Client Secret
+  5. Run this script and enter them when prompted
+  6. A browser tab opens → click "Agree" → done, tokens saved
+
+Controls:
+  space   play / pause
+  →       next track
+  ←       previous track  (press twice quickly to restart, once more for prev)
+  + / =   volume up  5 %
+  -       volume down 5 %
+  q       quit
+
+Pass --keylog to print raw key sequences and exit (for debugging).
+"""
+
+import io, json, logging, math, os, random, select, shutil, subprocess, sys, termios, threading, time, tty, urllib.parse, urllib.request
+from pathlib import Path
+
+try:
+    from PIL import Image
+except ImportError:
+    sys.exit("Missing dependency — run:  pip install Pillow")
+
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyOAuth
+except ImportError:
+    sys.exit("Missing dependency — run:  pip install spotipy")
+
+try:
+    import sounddevice as _sd
+    import numpy       as _np
+    _HAVE_FFT = True
+except ImportError:
+    _sd = _np = None
+    _HAVE_FFT = False
+
+# Suppress spotipy's HTTP error logging — errors are surfaced in the UI instead
+logging.getLogger("spotipy").setLevel(logging.CRITICAL)
+
+
+# ── config paths ──────────────────────────────────────────────────────────────
+
+CONFIG_DIR = Path.home() / ".config" / "spotify-chart"
+CREDS_FILE = CONFIG_DIR / "credentials.json"
+CACHE_FILE = CONFIG_DIR / ".cache"
+
+SCOPE    = ("user-read-playback-state "
+            "user-modify-playback-state "
+            "user-read-currently-playing "
+            "user-library-read "
+            "user-read-recently-played")
+REDIRECT = "http://127.0.0.1:9090/callback"
+
+
+# ── ANSI helpers ──────────────────────────────────────────────────────────────
+
+RESET  = "\x1b[0m"
+BOLD   = "\x1b[1m"
+DIM    = "\x1b[90m"
+GREEN  = "\x1b[32m"
+YELLOW = "\x1b[33m"
+RED    = "\x1b[31m"
+
+def fg(r, g, b):
+    return f"\x1b[38;2;{r};{g};{b}m"
+
+def _eq_color(frac: float) -> str:
+    """EQ gradient: near-white (top peaks) → cyan → electric blue-purple (base).
+    frac 0 = top, 1 = bottom."""
+    stops = [
+        (0.00, (215, 245, 255)),   # near-white peak
+        (0.18, (  0, 215, 255)),   # bright cyan
+        (0.50, (  0, 130, 255)),   # blue-cyan
+        (0.78, ( 50,  55, 255)),   # electric blue
+        (1.00, (110,  40, 220)),   # blue-purple base
+    ]
+    for i in range(len(stops) - 1):
+        f0, (r0, g0, b0) = stops[i]
+        f1, (r1, g1, b1) = stops[i + 1]
+        if frac <= f1:
+            t = (frac - f0) / (f1 - f0)
+            return (f"\x1b[38;2;"
+                    f"{int(r0 + t*(r1-r0))};"
+                    f"{int(g0 + t*(g1-g0))};"
+                    f"{int(b0 + t*(b1-b0))}m")
+    r, g, b = stops[-1][1]
+    return f"\x1b[38;2;{r};{g};{b}m"
+
+
+# ── braille ───────────────────────────────────────────────────────────────────
+
+# dot bit positions within a braille cell: DOTS[row 0-3][col 0-1]
+DOTS = ((0x01, 0x08), (0x02, 0x10), (0x04, 0x20), (0x40, 0x80))
+
+
+def render_art(img: Image.Image, cols: int, rows: int,
+               alpha_thresh: int = 64) -> list:
+    """Return a list of strings — one colored braille line per row.
+
+    Each braille cell samples 2×4 pixels from the scaled image.
+    Pixels with alpha < alpha_thresh are treated as transparent: the
+    corresponding dot is left unset so the terminal background shows through.
+    Set dots are colored with the average RGBA of the opaque pixels in the cell.
+    """
+    pw, ph = cols * 2, rows * 4
+    img = img.convert("RGBA").resize((pw, ph), Image.LANCZOS)
+    px  = img.load()
+
+    lines = []
+    for row in range(rows):
+        parts = []
+        for col in range(cols):
+            bits = r_sum = g_sum = b_sum = n = 0
+            for dr in range(4):
+                for dc in range(2):
+                    x, y = col * 2 + dc, row * 4 + dr
+                    r, g, b, a = px[x, y]
+                    if a >= alpha_thresh:
+                        bits  |= DOTS[dr][dc]
+                        r_sum += r
+                        g_sum += g
+                        b_sum += b
+                        n     += 1
+            if bits and n:
+                parts.append(
+                    f"{fg(r_sum // n, g_sum // n, b_sum // n)}"
+                    f"{chr(0x2800 + bits)}{RESET}"
+                )
+            else:
+                parts.append(" ")
+        lines.append("".join(parts))
+    return lines
+
+
+# ── equalizer ─────────────────────────────────────────────────────────────────
+
+class Equalizer:
+    """Animated spectrum-analyser display.
+    Simulates frequency bands with layered oscillators + random transient spikes.
+    Fast attack / slow decay gives a VU-meter feel without real audio data.
+    """
+
+    def __init__(self, bands: int = 64):
+        self.bands      = bands
+        self.heights    = [0.0] * bands   # current bar height  0–1
+        self.peaks      = [0.0] * bands   # peak-hold position  0–1
+        self.peak_hold  = [0]   * bands   # ticks remaining at peak before falling
+        self._t         = 0.0
+
+    def tick(self, dt: float = 0.1):
+        self._t += dt
+        t = self._t
+        for i in range(self.bands):
+            f = i / self.bands          # band position 0 (bass) → 1 (treble)
+
+            # Multiple oscillators at coprime rates → pseudo-musical motion
+            v = (abs(math.sin(t * 2.1 + f * 6.3)) * 0.28 +
+                 abs(math.sin(t * 1.4 + f * 3.1)) * 0.23 +
+                 abs(math.sin(t * 3.8 - f * 4.2)) * 0.19 +
+                 abs(math.sin(t * 0.9 + f * 8.7)) * 0.16 +
+                 abs(math.sin(t * 5.1 - f * 2.0)) * 0.14)
+
+            # Frequency shaping: bass boost, treble roll-off
+            if   f < 0.12: v *= 1.55
+            elif f < 0.25: v *= 1.25
+            elif f > 0.80: v *= 0.50
+            elif f > 0.65: v *= 0.75
+
+            # Occasional transient spike (kick / snare simulation)
+            if random.random() < 0.014:
+                v = min(1.0, v + random.uniform(0.25, 0.65))
+
+            target = min(1.0, v)
+
+            # Fast attack, slow decay
+            if target > self.heights[i]:
+                self.heights[i] = min(target, self.heights[i] + 0.30)
+            else:
+                self.heights[i] = max(target, self.heights[i] - 0.05)
+
+            # Peak hold: latch at new high, hold 5 ticks (0.5 s), then fall
+            if self.heights[i] >= self.peaks[i]:
+                self.peaks[i]     = self.heights[i]
+                self.peak_hold[i] = 5
+            else:
+                if self.peak_hold[i] > 0:
+                    self.peak_hold[i] -= 1
+                else:
+                    self.peaks[i] = max(0.0, self.peaks[i] - 0.018)
+
+    def decay(self, rate: float = 0.03):
+        """Drain bars slowly — called while playback is paused."""
+        for i in range(self.bands):
+            self.heights[i]   = max(0.0, self.heights[i] - rate)
+            self.peaks[i]     = max(0.0, self.peaks[i]   - rate * 0.5)
+            self.peak_hold[i] = 0
+
+    def drive(self, targets, beat_str: float = 0.0):
+        """Set bar heights from audio analysis targets with fast attack/slow decay."""
+        for i in range(self.bands):
+            t = min(1.0, targets[i] + beat_str)
+            if t > self.heights[i]:
+                self.heights[i] = min(t, self.heights[i] + 0.35)
+            else:
+                self.heights[i] = max(t, self.heights[i] - 0.06)
+
+            if self.heights[i] >= self.peaks[i]:
+                self.peaks[i]     = self.heights[i]
+                self.peak_hold[i] = 5
+            else:
+                if self.peak_hold[i] > 0:
+                    self.peak_hold[i] -= 1
+                else:
+                    self.peaks[i] = max(0.0, self.peaks[i] - 0.018)
+
+    def render(self, cols: int, rows: int) -> list:
+        """Segmented LED-style bars: wide columns, horizontal segment gaps,
+        pink accent stripes, white→cyan→blue-purple gradient.
+        """
+        BAR_W    = 3      # character columns per bar
+        GAP_W    = 1      # gap columns between bars
+        STEP     = BAR_W + GAP_W
+        HOT_PINK = "\x1b[38;2;255;30;190m"
+        # Upper-half braille: dot rows 0+1, both columns → ⠛
+        SEG_BITS = DOTS[0][0] | DOTS[0][1] | DOTS[1][0] | DOTS[1][1]
+
+        # Skip the lowest EQ bands — they fall between FFT bins (~20–43 Hz)
+        # and are always zero, creating an apparent gap at the left edge.
+        BAND_SKIP  = 8
+        band_range = max(1, self.bands - BAND_SKIP)
+        n_bars = max(1, (cols + GAP_W) // STEP)
+        h = [self.heights[BAND_SKIP + int(i * band_range / n_bars)] for i in range(n_bars)]
+        p = [self.peaks  [BAND_SKIP + int(i * band_range / n_bars)] for i in range(n_bars)]
+
+        grid = [[0]     * cols for _ in range(rows)]
+        pink = [[False] * cols for _ in range(rows)]
+
+        for b in range(n_bars):
+            lit     = int(h[b] * rows)
+            bar_top = rows - lit                        # topmost lit character row
+            pr      = int((1.0 - p[b]) * (rows - 1))  # peak character row (0=top)
+
+            # Bar segments (bottom up)
+            for offset in range(lit):
+                cr = rows - 1 - offset
+                for bc in range(BAR_W):
+                    cc = b * STEP + bc
+                    if cc >= cols:
+                        break
+                    grid[cr][cc] = SEG_BITS
+                    if offset % 5 == 1:
+                        pink[cr][cc] = True
+
+            # Floating peak indicator — pink segment above the current bar
+            if p[b] > 0.02 and pr < bar_top:
+                for bc in range(BAR_W):
+                    cc = b * STEP + bc
+                    if cc >= cols:
+                        break
+                    grid[pr][cc] = SEG_BITS
+                    pink[pr][cc] = True
+
+        lines = []
+        for row in range(rows):
+            color = _eq_color(row / max(1, rows - 1))
+            chars = []
+            for col in range(cols):
+                bits = grid[row][col]
+                if bits:
+                    c = HOT_PINK if pink[row][col] else color
+                    chars.append(f"{c}{chr(0x2800 + bits)}{RESET}")
+                else:
+                    chars.append(" ")
+            lines.append("".join(chars))
+        return lines
+
+
+# ── auth + credentials ────────────────────────────────────────────────────────
+
+def _print_setup():
+    print(f"""
+{BOLD}First-time Spotify setup{RESET}
+
+1. Open:  https://developer.spotify.com/dashboard
+2. "Create app" — fill in any name and description
+3. Set Redirect URI to:  {REDIRECT}
+   (click "Add" after pasting, then Save)
+4. Go to Settings → copy your Client ID and Client Secret
+""")
+
+
+def _load_creds():
+    if CREDS_FILE.exists():
+        return json.loads(CREDS_FILE.read_text())
+    return None
+
+
+def connect() -> spotipy.Spotify:
+    """Return an authenticated Spotify client.
+    Prompts for credentials on first run; uses cached tokens thereafter.
+    """
+    creds = _load_creds()
+    if not creds:
+        _print_setup()
+        client_id     = input("Client ID:     ").strip()
+        client_secret = input("Client Secret: ").strip()
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CREDS_FILE.write_text(json.dumps(
+            {"client_id": client_id, "client_secret": client_secret}, indent=2
+        ))
+        creds = {"client_id": client_id, "client_secret": client_secret}
+        print("\nA browser tab will open — click Agree to authorize.\n")
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    return spotipy.Spotify(auth_manager=SpotifyOAuth(
+        client_id     = creds["client_id"],
+        client_secret = creds["client_secret"],
+        redirect_uri  = REDIRECT,
+        scope         = SCOPE,
+        cache_path    = str(CACHE_FILE),
+        open_browser  = True,
+    ))
+
+
+# ── playback helpers ──────────────────────────────────────────────────────────
+
+def _ms(ms: int) -> str:
+    s = ms // 1000
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def progress_bar(progress_ms: int, duration_ms: int, width: int) -> str:
+    ratio  = progress_ms / duration_ms if duration_ms else 0
+    filled = max(0, min(width, int(round(ratio * width))))
+    _FILL  = "\x1b[38;2;35;95;58m"    # muted green for played portion
+    _TRACK = "\x1b[38;2;14;36;22m"    # dark green for remaining
+    bar    = (f"{_FILL}{'⣿' * filled}{RESET}"
+              f"{_TRACK}{'⣿' * (width - filled)}{RESET}")
+    return f"{DIM}{_ms(progress_ms)}{RESET} {bar} {DIM}{_ms(duration_ms)}{RESET}"
+
+
+def _vol(pb):
+    try:
+        return pb["device"]["volume_percent"]
+    except (TypeError, KeyError):
+        return None
+
+
+# ── keyboard (raw tty) ────────────────────────────────────────────────────────
+
+def _as(cmd):
+    """Send an AppleScript command to the local Spotify Mac app.
+    Returns None on success, short error string on failure."""
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", f"tell application \"Spotify\" to {cmd}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return None if r.returncode == 0 else (r.stderr.strip() or "AppleScript error")
+    except FileNotFoundError:
+        return "osascript not found"
+    except subprocess.TimeoutExpired:
+        return "Spotify not responding"
+    except Exception as e:
+        return str(e)[:60]
+
+
+# Raw byte buffer — bypasses Python's TextIOWrapper/BufferedReader so that
+# select() and our reads stay in sync (buffered IO reads ahead and empties
+# the fd, making select() miss bytes that are sitting in Python's buffer).
+_raw_buf = b""
+_esc_buf = ""    # partial escape sequence accumulator (str)
+_esc_t   = 0.0   # wall time when leading ESC was received
+
+
+def _refill_raw():
+    """Drain all immediately-available stdin bytes into _raw_buf via os.read."""
+    global _raw_buf
+    while select.select([sys.stdin], [], [], 0)[0]:
+        try:
+            chunk = os.read(sys.stdin.fileno(), 64)
+            if chunk:
+                _raw_buf += chunk
+            else:
+                break
+        except OSError:
+            break
+
+
+def read_key():
+    """Non-blocking stateful key reader.  Returns a complete keypress or None."""
+    global _raw_buf, _esc_buf, _esc_t
+
+    _refill_raw()   # pull any new bytes off the fd into our buffer
+
+    if _esc_buf:
+        # Drain as many bytes as needed to complete or abandon the sequence
+        while _raw_buf:
+            ch = chr(_raw_buf[0])
+            _raw_buf = _raw_buf[1:]
+            _esc_buf += ch
+            if (len(_esc_buf) >= 3
+                    and _esc_buf[1] in ('[', 'O')
+                    and _esc_buf[-1].isalpha()):
+                key, _esc_buf = _esc_buf, ""
+                return key
+        # No more bytes — wait up to 200 ms for the rest
+        if time.time() - _esc_t > 0.20:
+            key, _esc_buf = _esc_buf, ""
+            return key
+        return None
+
+    if not _raw_buf:
+        return None
+
+    ch = chr(_raw_buf[0])
+    _raw_buf = _raw_buf[1:]
+
+    if ch == "\x1b":
+        _esc_buf = ch
+        _esc_t   = time.time()
+        # Try to complete the sequence immediately with buffered bytes
+        return read_key()
+
+    return ch
+
+
+# ── FFT audio capture (BlackHole loopback) ────────────────────────────────────
+
+def _find_blackhole():
+    """Return the input device index for BlackHole, or None if not found."""
+    if not _HAVE_FFT:
+        return None
+    try:
+        for i, d in enumerate(_sd.query_devices()):
+            if "blackhole" in d["name"].lower() and d["max_input_channels"] >= 1:
+                return i
+    except Exception:
+        pass
+    return None
+
+
+class AudioCapture:
+    """Streams audio from a BlackHole loopback device and exposes FFT bands."""
+
+    _FFT_SIZE = 2048
+
+    def __init__(self, device_idx):
+        dev          = _sd.query_devices(device_idx)
+        self._sr     = int(dev["default_samplerate"])
+        self._buf    = _np.zeros(self._FFT_SIZE, dtype=_np.float32)
+        self._lock   = threading.Lock()
+        self._band_peaks = []  # per-band rolling peaks for AGC
+        n_ch         = min(2, dev["max_input_channels"])
+        self._stream = _sd.InputStream(
+            device=device_idx,
+            channels=n_ch,
+            samplerate=self._sr,
+            blocksize=512,
+            dtype="float32",
+            callback=self._cb,
+        )
+        self._stream.start()
+
+    def _cb(self, indata, frames, _t, _s):
+        # Mix to mono, append to rolling buffer
+        mono = indata.mean(axis=1) if indata.shape[1] > 1 else indata[:, 0]
+        with self._lock:
+            self._buf = _np.roll(self._buf, -len(mono))
+            self._buf[-len(mono):] = mono
+
+    def get_bands(self, n):
+        """Return n log-scale magnitude bands normalised 0–1."""
+        with self._lock:
+            buf = self._buf.copy()
+
+        # Hann window + real FFT
+        mag   = _np.abs(_np.fft.rfft(buf * _np.hanning(len(buf))))
+        freqs = _np.fft.rfftfreq(len(buf), 1.0 / self._sr)
+
+        # Map bins → n log-scale bands (20 Hz – 20 kHz)
+        out = []
+        for i in range(n):
+            lo = 20.0 * (1000.0 ** (i / n))
+            hi = 20.0 * (1000.0 ** ((i + 1) / n))
+            m  = mag[(freqs >= lo) & (freqs < hi)]
+            out.append(float(m.mean()) if len(m) else 0.0)
+
+        # Fill bands that fall between FFT bins (empty due to coarse resolution)
+        # by linear interpolation from their nearest non-empty neighbours.
+        out_np = _np.array(out, dtype=_np.float32)
+        nz = out_np > 0
+        if nz.any() and not nz.all():
+            idx = _np.arange(len(out_np), dtype=_np.float32)
+            out_np = _np.interp(idx, idx[nz], out_np[nz])
+        out = out_np.tolist()
+
+        # Per-band AGC: each band normalises against its own rolling peak so
+        # bass-heavy bands don't dominate the display (~2 s half-life at 10 fps).
+        if len(self._band_peaks) != n:
+            self._band_peaks = [1e-6] * n
+        result = []
+        for i, v in enumerate(out):
+            self._band_peaks[i] = max(v, self._band_peaks[i] * 0.97)
+            result.append(min(1.0, v / self._band_peaks[i] * 0.85))
+        return result
+
+    def close(self):
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception:
+            pass
+
+
+# ── audio analysis helpers ────────────────────────────────────────────────────
+
+def _find_current(items, pos_s):
+    """Binary search: return the item whose start ≤ pos_s."""
+    if not items:
+        return None
+    lo, hi = 0, len(items) - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if items[mid]["start"] <= pos_s:
+            lo = mid
+        else:
+            hi = mid - 1
+    return items[lo]
+
+
+def _analysis_targets(analysis, pos_s, n_bands):
+    """Return (targets, beat_strength) for the given playback position.
+
+    Low bands  ← pitch chroma (12 values, already 0–1) × loudness level.
+    High bands ← timbre shape (coefficients 1–11, normalised) × loudness level.
+    Beat spike ← confidence × recency, fades over 100 ms.
+    """
+    seg  = _find_current(analysis["segments"], pos_s)
+    beat = _find_current(analysis["beats"],    pos_s)
+
+    if seg is None:
+        return [0.2] * n_bands, 0.0
+
+    # Overall level: segment loudness_max in dB → 0–1 (-40..0 dB range)
+    level = max(0.0, min(1.0, (seg.get("loudness_max", -30) + 40) / 40))
+
+    pitches = seg.get("pitches", [0.5] * 12)          # already 0–1
+    raw_t   = seg.get("timbre",  [0.0] * 12)
+    # Normalise timbre[1..11]; coefficient 0 is loudness-like, skip it
+    timbre  = [max(0.0, min(1.0, (raw_t[i] + 100) / 200.0)) for i in range(1, 12)]
+
+    targets = []
+    for b in range(n_bands):
+        f = b / n_bands
+        if f < 0.5:                           # low bands ← pitch chroma
+            idx      = f * 2 * 11
+            lo, hi_i = int(idx), min(11, int(idx) + 1)
+            val      = pitches[lo] * (1 - idx % 1) + pitches[hi_i] * (idx % 1)
+        else:                                 # high bands ← timbre
+            idx      = (f - 0.5) * 2 * 10
+            lo, hi_i = int(idx), min(10, int(idx) + 1)
+            val      = timbre[lo] * (1 - idx % 1) + timbre[hi_i] * (idx % 1)
+        targets.append(min(1.0, val * level * 1.4))
+
+    # Beat spike: fades over 100 ms after the beat onset
+    beat_str = 0.0
+    if beat is not None:
+        age = pos_s - beat["start"]
+        if 0.0 <= age < 0.10:
+            beat_str = beat.get("confidence", 0.0) * (1.0 - age / 0.10) * 0.25
+
+    return targets, beat_str
+
+
+# ── spotifyd helpers ──────────────────────────────────────────────────────────
+
+_SPOTIFYD_DEVICE_NAME = "Terminal Player"
+
+
+def _spotifyd_device_id(sp_client):
+    """Return device ID of the running spotifyd instance, or None."""
+    try:
+        devs = sp_client.devices() or {}
+        for d in devs.get("devices", []):
+            if d.get("name") == _SPOTIFYD_DEVICE_NAME:
+                return d["id"]
+    except Exception:
+        pass
+    return None
+
+
+_SPOTIFYD_CONF = str(Path.home() / ".config" / "spotifyd" / "spotifyd.conf")
+
+def _launch_spotifyd():
+    """Kill any stale spotifyd instances, then start a fresh one."""
+    try:
+        subprocess.run(["pkill", "-x", "spotifyd"], capture_output=True)
+        import time as _t; _t.sleep(0.3)   # brief pause so port is released
+    except Exception:
+        pass
+    try:
+        cmd = ["spotifyd", "--no-daemon", "--backend", "portaudio"]
+        if Path(_SPOTIFYD_CONF).exists():
+            cmd += ["--config-path", _SPOTIFYD_CONF]
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return None
+
+
+# ── main loop ─────────────────────────────────────────────────────────────────
+
+def main():
+    sp = connect()   # auth happens here, before raw-tty mode
+
+    # Get the user's Spotify ID (for liked-songs context URI)
+    try:
+        _user_id = (sp.me() or {}).get("id", "")
+    except Exception:
+        _user_id = ""
+
+    # ── Background Music + Multi-Output Device ───────────────────────────────
+    _MULTI_OUT   = "Multi-Output Device"
+    _BG_SPEAKERS = "MacBook Air Speakers"
+
+    # CoreAudio direct volume control — works even when BG Music locks system vol
+    try:
+        import ctypes, ctypes.util
+        _CA = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+        _CF = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+        _CF.CFStringGetCString.restype = ctypes.c_bool
+        _CF.CFRelease.restype  = None
+        _CF.CFRelease.argtypes = [ctypes.c_void_p]
+
+        class _PropAddr(ctypes.Structure):
+            _fields_ = [("s", ctypes.c_uint32), ("sc", ctypes.c_uint32), ("e", ctypes.c_uint32)]
+
+        def _ca_device_id(name):
+            a  = _PropAddr(0x64657623, 0x676c6f62, 0)  # dev#, glob
+            sz = ctypes.c_uint32(0)
+            _CA.AudioObjectGetPropertyDataSize(1, ctypes.byref(a), 0, None, ctypes.byref(sz))
+            ids = (ctypes.c_uint32 * (sz.value // 4))()
+            _CA.AudioObjectGetPropertyData(1, ctypes.byref(a), 0, None, ctypes.byref(sz), ids)
+            for did in ids:
+                a2    = _PropAddr(0x6c6e616d, 0x676c6f62, 0)  # lnam
+                cfstr = ctypes.c_void_p(0)
+                sz2   = ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
+                _CA.AudioObjectGetPropertyData(did, ctypes.byref(a2), 0, None,
+                                               ctypes.byref(sz2), ctypes.byref(cfstr))
+                if not cfstr:
+                    continue
+                buf = ctypes.create_string_buffer(256)
+                ok  = _CF.CFStringGetCString(cfstr, buf, 256, 0x08000100)  # UTF-8
+                _CF.CFRelease(cfstr)
+                if ok and buf.value.decode("utf-8", errors="replace") == name:
+                    return did
+            return None
+
+        _HAVE_CA = True
+    except Exception:
+        _HAVE_CA = False
+        def _ca_device_id(name): return None   # noqa
+
+    # kAudioHardwareServiceDeviceProperty_VirtualMainVolume = 'vmvc'
+    _VMVC = _PropAddr(0x766d7663, 0x6f757470, 0)  # vmvc, outp, master
+
+    def _coreaudio_set_vol(vol_pct, device_name="MacBook Air Speakers"):
+        if not _HAVE_CA:
+            return
+        try:
+            did = _ca_device_id(device_name)
+            if did is None:
+                return
+            f = ctypes.c_float(vol_pct / 100.0)
+            _CA.AudioObjectSetPropertyData(did, ctypes.byref(_VMVC), 0, None,
+                                           ctypes.c_uint32(4), ctypes.byref(f))
+        except Exception:
+            pass
+
+    def _bgmusic_set_output(device):
+        """Set Background Music's internal output device via UI scripting."""
+        script = (
+            'tell application "System Events"\n'
+            '  if not (exists process "Background Music") then return\n'
+            '  tell process "Background Music"\n'
+            '    repeat with mbi in menu bar items of menu bar 2\n'
+            '      try\n'
+            '        set m to menu 1 of mbi\n'
+            f'        if exists menu item "{device}" of m then\n'
+            '          click mbi\n'
+            '          delay 0.4\n'
+            f'          click menu item "{device}" of m\n'
+            '          delay 0.15\n'
+            '          key code 53\n'
+            '          return\n'
+            '        end if\n'
+            '      end try\n'
+            '    end repeat\n'
+            '  end tell\n'
+            'end tell\n'
+        )
+        try:
+            subprocess.run(["osascript", "-e", script],
+                           capture_output=True, timeout=15)
+        except Exception:
+            pass
+
+    # Launch Background Music if not already running
+    _bgmusic_was_running = bool(
+        subprocess.run(["pgrep", "-x", "Background Music"],
+                       capture_output=True).returncode == 0
+    )
+    if not _bgmusic_was_running:
+        subprocess.Popen(["open", "-a", "Background Music"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # In background: wait for BG Music to be ready, then set its internal
+    # output to Multi-Output Device so audio flows: BG Music → Multi-Out →
+    # MacBook Air Speakers + BlackHole 2ch.  System output stays "Background
+    # Music" so auto-pause keeps working.
+    def _setup_bgmusic_output(launched=not _bgmusic_was_running):
+        if launched:
+            for _ in range(30):   # up to 15 s for BG Music to start
+                time.sleep(0.5)
+                if subprocess.run(["pgrep", "-x", "Background Music"],
+                                   capture_output=True).returncode == 0:
+                    break
+            time.sleep(1.5)       # extra settle for the menu to be ready
+        _bgmusic_set_output(_MULTI_OUT)
+    threading.Thread(target=_setup_bgmusic_output, daemon=True).start()
+
+    # Launch spotifyd and discover its device ID in a background thread
+    # so the UI never blocks on the Spotify API rate-limit sleep.
+    _spotifyd_proc     = _launch_spotifyd()
+    _spotifyd_id       = None
+    _spotifyd_box      = [None]   # filled by background thread once device registers
+    _api_blocked_until = [0.0]    # shared: wall-clock time when API calls are allowed again
+
+    # Cached bearer token — refreshed lazily; avoids an extra HTTP call per API request
+    _token_cache = [None, 0.0]   # [token_str, expiry_wall_time]
+
+    def _bearer():
+        """Return a valid bearer token, refreshing only when within 60 s of expiry."""
+        if _token_cache[0] and time.time() < _token_cache[1] - 60:
+            return _token_cache[0]
+        info = sp.auth_manager.get_cached_token()
+        if info and not sp.auth_manager.is_token_expired(info):
+            _token_cache[0] = info["access_token"]
+            _token_cache[1] = info["expires_at"]
+            return _token_cache[0]
+        info = sp.auth_manager.refresh_access_token(info["refresh_token"])
+        _token_cache[0] = info["access_token"]
+        _token_cache[1] = info["expires_at"]
+        return _token_cache[0]
+
+    def _devices_direct():
+        """Call /me/player/devices with a hard 5 s timeout, bypassing spotipy's
+        urllib3 retry-sleep which can block indefinitely on 429 responses."""
+        token = _bearer()
+        req = urllib.request.Request(
+            "https://api.spotify.com/v1/me/player/devices",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
+
+    def _discover_spotifyd(box=_spotifyd_box, _blk=_api_blocked_until):
+        time.sleep(2)
+        attempt = 0
+        while attempt < 120:
+            # Wait out any shared API block before touching the network
+            remaining = _blk[0] - time.time()
+            if remaining > 0:
+                _log(f"discover: api blocked for {int(remaining)}s, sleeping")
+                time.sleep(min(remaining, 30))
+                continue
+            try:
+                data = _devices_direct()
+                devs = data.get("devices") or []
+                names = [d.get("name") for d in devs]
+                _log(f"discover attempt {attempt}: devices={names}")
+                for d in devs:
+                    if d.get("name") == _SPOTIFYD_DEVICE_NAME:
+                        _log(f"discover: found Terminal Player id={d['id']}")
+                        box[0] = d["id"]
+                        return
+            except urllib.error.HTTPError as e:
+                ra = int(e.headers.get("Retry-After", 30))
+                _blk[0] = time.time() + ra
+                _log(f"discover attempt {attempt}: 429, blocking all api for {ra}s")
+                time.sleep(min(ra, 30))
+                continue
+            except Exception as e:
+                _log(f"discover attempt {attempt} error: {e}")
+            attempt += 1
+            time.sleep(5)
+        _log("discover: gave up")
+
+    _disc_th = threading.Thread(target=_discover_spotifyd, daemon=True)
+    _disc_th.start()
+    # Silence uncaught-thread-exception noise so it doesn't bleed into the UI
+    threading.excepthook = lambda _: None
+
+    # Optional FFT audio capture via BlackHole loopback
+    audio = None
+    bh_dev = _find_blackhole()
+    if bh_dev is not None:
+        try:
+            audio = AudioCapture(bh_dev)
+        except Exception:
+            audio = None
+    elif _HAVE_FFT:
+        print("FFT mode: BlackHole not found.\n"
+              "  brew install blackhole-2ch\n"
+              "  Then in Audio MIDI Setup, create a Multi-Output Device\n"
+              "  combining your speakers + BlackHole 2ch, and set it as\n"
+              "  your system output.\n")
+
+    eq             = Equalizer()
+    pb             = None
+    last_poll_time = 0.0
+    art_lines      = []
+    art_track_id   = None
+    analysis       = None
+    analysis_id    = None
+    status_msg     = ""
+    status_ticks   = 0
+    tick           = 0
+    next_poll      = 0.0   # wall-clock time of next playback poll
+    _cmd_box       = [None]   # error written by background command threads
+    _local_vol     = None   # None until first poll; reflects system volume
+    _vol_pending   = False  # True when vol changed but osascript not yet sent
+    _vol_last_key  = 0.0    # wall time of last vol keypress (for debounce)
+    _vol_sent_at   = 0.0    # wall time of last vol set; blocks sync for 2 s
+    _sysvol_box    = [None] # [current_system_vol] updated by background poller
+
+    def _sysvol_poller(box=_sysvol_box):
+        """Poll MacBook Air Speakers vmvc volume every 500 ms via CoreAudio."""
+        while True:
+            try:
+                if _HAVE_CA:
+                    did = _ca_device_id("MacBook Air Speakers")
+                    if did is not None:
+                        f   = ctypes.c_float(0)
+                        sz3 = ctypes.c_uint32(4)
+                        _CA.AudioObjectGetPropertyData(did, ctypes.byref(_VMVC), 0, None,
+                                                       ctypes.byref(sz3), ctypes.byref(f))
+                        box[0] = int(round(f.value * 100))
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+    threading.Thread(target=_sysvol_poller, daemon=True).start()
+
+    def _bg_api(fn, *args, **kwargs):
+        """Call a spotipy method in a background thread; errors surface in UI."""
+        def _run():
+            try:
+                fn(*args, **kwargs)
+            except Exception as e:
+                _cmd_box[0] = str(e)[:80]
+        threading.Thread(target=_run, daemon=True).start()
+
+    # Background thread result boxes: [value, key]
+    # key is a sentinel — wall_time for pb, track_id for art/analysis
+    _pb_box  = [None, -1.0]   # [pb_result, wall_time]; -1 = nothing ready
+    _pb_th   = None
+    _art_box = [None, None]   # [art_lines, track_id]
+    _art_th  = None
+    _ana_box = [None, None]   # [analysis_dict, track_id]
+    _ana_th  = None
+
+    # Debug log — tail with: tail -f /tmp/spotify-debug.log
+    _dbg = open("/tmp/spotify-debug.log", "w", buffering=1)
+    def _log(*args):
+        _dbg.write(time.strftime("%H:%M:%S") + " " + " ".join(str(a) for a in args) + "\n")
+
+    _log("startup: user_id=%r spotifyd_proc=%s" % (_user_id, _spotifyd_proc and "running" or "None"))
+
+    old_term = termios.tcgetattr(sys.stdin)
+    tty.setraw(sys.stdin.fileno())
+    sys.stdout.write("\x1b[?25l")   # hide cursor
+
+    try:
+        while True:
+            _t0 = time.time()   # frame start — used for sleep correction
+
+            # ── keyboard input — drain all buffered keys each frame ───────────
+            keys = []
+            while True:
+                k = read_key()
+                if k is None:
+                    break
+                keys.append(k)
+
+            if keys:
+                _log("keys=%r  pb_has_item=%s  spotifyd_id=%r" % (
+                    keys,
+                    bool(pb and pb.get("item")),
+                    _spotifyd_id,
+                ))
+
+            # Surface any error from the last background command
+            if _cmd_box[0]:
+                status_msg, status_ticks = _cmd_box[0], 40
+                _log("cmd_error:", _cmd_box[0])
+                _cmd_box[0] = None
+
+            quit_now  = False
+            did_skip  = False   # fire skip/prev at most once per frame
+            vol_delta = 0       # accumulate multiple +/- presses
+            do_search = False
+            do_recent = False
+            for key in keys:
+                if key in ("q", "\x03"):
+                    quit_now = True
+                    break
+                elif key in (" ", "l"):
+                    sid = _spotifyd_id
+                    if key == "l" or (not pb or not pb.get("item")):
+                        # l key (any screen) or space on nothing-playing: shuffle liked songs
+                        if sid:
+                            uid = _user_id
+                            ctx = (f"spotify:user:{uid}:collection" if uid
+                                   else "spotify:collection")
+                            def _start_liked(sid=sid, ctx=ctx):
+                                try:
+                                    token = _bearer()
+                                    hdrs = {
+                                        "Authorization": f"Bearer {token}",
+                                        "Content-Type": "application/json",
+                                    }
+                                    try:
+                                        r = urllib.request.Request(
+                                            "https://api.spotify.com/v1/me/tracks?limit=1",
+                                            headers={"Authorization": f"Bearer {token}"},
+                                        )
+                                        with urllib.request.urlopen(r, timeout=5) as resp:
+                                            total = json.loads(resp.read()).get("total", 1)
+                                        offset = random.randint(0, max(0, total - 1))
+                                    except Exception:
+                                        offset = 0
+                                    body = json.dumps({"context_uri": ctx, "offset": {"position": offset}}).encode()
+                                    req = urllib.request.Request(
+                                        f"https://api.spotify.com/v1/me/player/play?device_id={sid}",
+                                        data=body, method="PUT", headers=hdrs,
+                                    )
+                                    urllib.request.urlopen(req, timeout=5).close()
+                                    time.sleep(0.5)
+                                    req2 = urllib.request.Request(
+                                        f"https://api.spotify.com/v1/me/player/shuffle?state=true&device_id={sid}",
+                                        data=b"", method="PUT", headers=hdrs,
+                                    )
+                                    urllib.request.urlopen(req2, timeout=5).close()
+                                    _log("_start_liked: done")
+                                except Exception as e:
+                                    _log("_start_liked ERROR:", e)
+                                    _cmd_box[0] = str(e)[:80]
+                            threading.Thread(target=_start_liked, daemon=True).start()
+                            next_poll = time.time() + 1.5
+                        else:
+                            _log("liked: no spotifyd_id yet")
+                    elif pb.get("is_playing"):
+                        _log("SPACE: pausing")
+                        _bg_api(sp.pause_playback)
+                    else:
+                        _log("SPACE: resuming device=%r" % _spotifyd_id)
+                        _bg_api(sp.start_playback, device_id=_spotifyd_id)
+                elif key == "\x1b[C" and not did_skip:
+                    did_skip = True
+                    _bg_api(sp.next_track)
+                    next_poll = time.time() + 0.5
+                elif key == "\x1b[D" and not did_skip:
+                    did_skip = True
+                    _bg_api(sp.previous_track)
+                    next_poll = time.time() + 0.5
+                elif key in ("\x1b[A", "+", "="):   # up arrow or +
+                    vol_delta += 5
+                elif key in ("\x1b[B", "-"):         # down arrow or -
+                    vol_delta -= 5
+                elif key == "/":
+                    do_search = True
+                elif key == "r":
+                    do_recent = True
+
+            if quit_now:
+                break
+
+            # ── search prompt (temporarily leave raw mode) ────────────────────
+            if do_search:
+                do_search = False
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
+                sys.stdout.write("\x1b[?25h")   # show cursor
+                sys.stdout.write("\r\n  Search: ")
+                sys.stdout.flush()
+                try:
+                    query = sys.stdin.readline().strip()
+                except Exception:
+                    query = ""
+                tty.setraw(sys.stdin.fileno())
+                sys.stdout.write("\x1b[?25l")   # hide cursor
+                if query and _spotifyd_id:
+                    sid = _spotifyd_id
+                    status_msg, status_ticks = f"Searching: {query}", 60
+                    def _search_play(q=query, sid=sid):
+                        try:
+                            token = _bearer()
+                            hdrs = {"Authorization": f"Bearer {token}",
+                                    "Content-Type": "application/json"}
+                            url = ("https://api.spotify.com/v1/search"
+                                   f"?q={urllib.parse.quote(q)}&type=track&limit=1")
+                            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+                            with urllib.request.urlopen(req, timeout=5) as resp:
+                                data = json.loads(resp.read())
+                            items = data.get("tracks", {}).get("items", [])
+                            if not items:
+                                _cmd_box[0] = f"No results: {q}"
+                                return
+                            track = items[0]
+                            track_uri = track["uri"]
+                            body = json.dumps({"uris": [track_uri]}).encode()
+                            req2 = urllib.request.Request(
+                                f"https://api.spotify.com/v1/me/player/play?device_id={sid}",
+                                data=body, method="PUT", headers=hdrs,
+                            )
+                            urllib.request.urlopen(req2, timeout=5).close()
+                            name = track["name"]
+                            artist = track["artists"][0]["name"] if track.get("artists") else ""
+                            _cmd_box[0] = f"Playing: {name} — {artist}"
+                        except Exception as e:
+                            _cmd_box[0] = str(e)[:80]
+                    threading.Thread(target=_search_play, daemon=True).start()
+                    next_poll = time.time() + 1.5
+
+            # ── play most recently played ─────────────────────────────────────
+            if do_recent and _spotifyd_id:
+                do_recent = False
+                sid = _spotifyd_id
+                status_msg, status_ticks = "Loading recent…", 60
+                def _play_recent(sid=sid):
+                    try:
+                        token = _bearer()
+                        hdrs = {"Authorization": f"Bearer {token}",
+                                "Content-Type": "application/json"}
+                        # Prefer locally saved state — accurate to the last frame
+                        last = None
+                        try:
+                            last = json.loads((CONFIG_DIR / "last_session.json").read_text())
+                        except Exception:
+                            pass
+                        if last:
+                            if last.get("context_uri"):
+                                body = json.dumps({
+                                    "context_uri": last["context_uri"],
+                                    "offset":      {"uri": last["track_uri"]},
+                                    "position_ms": last.get("progress_ms", 0),
+                                }).encode()
+                            else:
+                                body = json.dumps({
+                                    "uris":        [last["track_uri"]],
+                                    "position_ms": last.get("progress_ms", 0),
+                                }).encode()
+                            name   = last.get("track_name", "")
+                            artist = last.get("artist", "")
+                        else:
+                            # Fall back to recently-played API
+                            req = urllib.request.Request(
+                                "https://api.spotify.com/v1/me/player/recently-played?limit=1",
+                                headers={"Authorization": f"Bearer {token}"},
+                            )
+                            with urllib.request.urlopen(req, timeout=5) as resp:
+                                data = json.loads(resp.read())
+                            items = data.get("items", [])
+                            if not items:
+                                _cmd_box[0] = "No recent history found"
+                                return
+                            item    = items[0]
+                            track   = item["track"]
+                            context = item.get("context")
+                            if context and context.get("uri"):
+                                body = json.dumps({
+                                    "context_uri": context["uri"],
+                                    "offset":      {"uri": track["uri"]},
+                                }).encode()
+                            else:
+                                body = json.dumps({"uris": [track["uri"]]}).encode()
+                            name   = track["name"]
+                            artist = track["artists"][0]["name"] if track.get("artists") else ""
+                        req2 = urllib.request.Request(
+                            f"https://api.spotify.com/v1/me/player/play?device_id={sid}",
+                            data=body, method="PUT", headers=hdrs,
+                        )
+                        urllib.request.urlopen(req2, timeout=5).close()
+                        _cmd_box[0] = f"Resuming: {name} — {artist}"
+                    except Exception as e:
+                        _cmd_box[0] = str(e)[:80]
+                threading.Thread(target=_play_recent, daemon=True).start()
+                next_poll = time.time() + 1.5
+
+            if vol_delta != 0:
+                if _local_vol is None:
+                    _local_vol = 80
+                _local_vol = max(0, min(100, _local_vol + vol_delta))
+                _vol_pending  = True
+                _vol_last_key = time.time()
+
+            # Fire volume change 150 ms after last keypress (debounce)
+            if _vol_pending and (time.time() - _vol_last_key) >= 0.15:
+                _vol_pending = False
+                _vol_sent_at = time.time()
+                nv = _local_vol
+                _log(f"VOL coreaudio {nv}%")
+                threading.Thread(target=_coreaudio_set_vol, args=(nv,), daemon=True).start()
+
+            # ── background playback poll (~3 s; stops completely on 429) ────
+            _now = time.time()
+            _blocked = _api_blocked_until[0] > _now
+            if not _blocked and _now >= next_poll and (_pb_th is None or not _pb_th.is_alive()):
+                next_poll = _now + 3.0
+                box = [None, -1.0]
+                def _fetch_pb(b=box, _blk=_api_blocked_until):
+                    try:
+                        token = _bearer()
+                        req = urllib.request.Request(
+                            "https://api.spotify.com/v1/me/player?additional_types=episode,track",
+                            headers={"Authorization": f"Bearer {token}"},
+                        )
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            raw = resp.read()
+                        b[0] = json.loads(raw) if raw else None
+                        if not raw:
+                            _log("pb poll: 204 no content")
+                        else:
+                            _log("pb poll ok: item=%r is_playing=%r device=%r" % (
+                                b[0].get("item", {}).get("name"),
+                                b[0].get("is_playing"),
+                                (b[0].get("device") or {}).get("name"),
+                            ))
+                    except urllib.error.HTTPError as e:
+                        ra = int(e.headers.get("Retry-After", 30))
+                        _blk[0] = time.time() + ra
+                        _log(f"pb poll 429: blocking ALL api calls for {ra}s")
+                    except Exception as e:
+                        _log(f"pb poll ERROR: {e}")
+                    b[1] = time.time()
+                _pb_th  = threading.Thread(target=_fetch_pb, daemon=True)
+                _pb_box = box
+                _pb_th.start()
+
+            # Apply completed pb result
+            if _pb_th and not _pb_th.is_alive() and _pb_box[1] > 0:
+                pb, last_poll_time = _pb_box[0], _pb_box[1]
+                _pb_box[1] = -1.0
+
+            # Sync system volume from background poller when no change is in flight
+            if not _vol_pending and (time.time() - _vol_sent_at) > 2.0:
+                sv = _sysvol_box[0]
+                if sv is not None:
+                    _local_vol = sv
+
+            tick += 1
+            term_w, term_h = shutil.get_terminal_size((120, 30))
+
+            # ── nothing playing ───────────────────────────────────────────────
+            # Pick up spotifyd device ID once the background thread finds it
+            if _spotifyd_id is None and _spotifyd_box[0]:
+                _spotifyd_id = _spotifyd_box[0]
+
+            if not pb or not pb.get("item"):
+                rl_until = _api_blocked_until[0]
+                if rl_until > time.time():
+                    remaining = int(rl_until - time.time())
+                    mins, secs = divmod(remaining, 60)
+                    hint = f"{RED}Spotify rate-limited — clears in {mins}m {secs:02d}s{RESET}"
+                elif _spotifyd_id:
+                    vol_hint = f"  ↑↓ = sys vol ({_local_vol}%)" if _local_vol is not None else "  ↑↓ = sys vol"
+                    hint = f"space/l = liked  r = recent  / = search{vol_hint}"
+                elif _spotifyd_box[0] is None and _spotifyd_proc:
+                    hint = "starting Terminal Player device…"
+                else:
+                    hint = "Open Spotify on any device and start something."
+                sys.stdout.write(
+                    "\x1b[H"
+                    f"\r\n  {DIM}Nothing playing.{RESET}\x1b[K\r\n"
+                    f"  {hint}\x1b[K\r\n"
+                    f"  {DIM}q = quit{RESET}\x1b[K\r\n"
+                    "\x1b[J"
+                )
+                sys.stdout.flush()
+                time.sleep(max(0.0, 0.1 - (time.time() - _t0)))
+                continue
+
+            # ── extract track metadata ────────────────────────────────────────
+            item     = pb["item"]
+            track    = item["name"]
+            artists  = ", ".join(a["name"] for a in item["artists"])
+            album    = item["album"]["name"]
+            prog_ms  = pb.get("progress_ms") or 0
+            dur_ms   = item.get("duration_ms") or 1
+            playing  = pb.get("is_playing", False)
+            device   = (pb.get("device") or {}).get("name", "")
+            volume   = _vol(pb)
+            images   = item["album"].get("images", [])
+            art_url  = images[0]["url"] if images else None
+            track_id = item.get("id")
+
+            # ── layout dimensions ─────────────────────────────────────────────
+            avail_rows = max(4, term_h - 7)   # 4 header + 3 footer
+            art_cols   = term_w // 2
+            eq_cols    = term_w - art_cols
+            art_rows   = min(avail_rows, art_cols // 2)
+
+            # ── background art fetch ───────────────────────────────────────────
+            if art_url and track_id != art_track_id and _art_box[1] != track_id:
+                if _art_th is None or not _art_th.is_alive():
+                    box = [None, track_id]
+                    def _fetch_art(b=box, url=art_url, ac=art_cols, ar=art_rows):
+                        try:
+                            with urllib.request.urlopen(url, timeout=10) as resp:
+                                img = Image.open(io.BytesIO(resp.read()))
+                            b[0] = render_art(img, ac, ar)
+                        except Exception:
+                            b[0] = []
+                    _art_th  = threading.Thread(target=_fetch_art, daemon=True)
+                    _art_box = box
+                    _art_th.start()
+
+            if (_art_th and not _art_th.is_alive() and
+                    _art_box[1] == track_id and art_track_id != track_id):
+                art_lines    = _art_box[0] or []
+                art_track_id = track_id
+
+            # ── background audio analysis fetch ───────────────────────────────
+            if track_id != analysis_id and _ana_box[1] != track_id:
+                if _ana_th is None or not _ana_th.is_alive():
+                    box = [None, track_id]
+                    def _fetch_ana(b=box, tid=track_id):
+                        try:
+                            raw = sp.audio_analysis(tid)
+                            b[0] = {"segments": raw.get("segments", []),
+                                    "beats":    raw.get("beats",    [])}
+                        except Exception as e:
+                            b[0] = f"ERR:{e}"
+                    _ana_th  = threading.Thread(target=_fetch_ana, daemon=True)
+                    _ana_box = box
+                    _ana_th.start()
+
+            if (_ana_th and not _ana_th.is_alive() and
+                    _ana_box[1] == track_id and analysis_id != track_id):
+                analysis    = _ana_box[0]
+                analysis_id = track_id
+
+            # ── tick or drain equalizer ────────────────────────────────────────
+            if playing:
+                if audio is not None:
+                    eq.drive(audio.get_bands(eq.bands))
+                elif isinstance(analysis, dict):
+                    pos_s = (prog_ms + (time.time() - last_poll_time) * 1000) / 1000.0
+                    targets, beat_str = _analysis_targets(analysis, pos_s, eq.bands)
+                    eq.drive(targets, beat_str)
+                else:
+                    eq.tick(dt=0.1)
+            else:
+                eq.decay()
+
+            # ── render ────────────────────────────────────────────────────────
+            eq_lines  = eq.render(eq_cols, art_rows)
+            blank_art = " " * art_cols
+            blank_eq  = " " * eq_cols
+            n_rows    = max(len(art_lines), len(eq_lines), art_rows)
+            combined  = [
+                (art_lines[i] if i < len(art_lines) else blank_art) +
+                (eq_lines[i]  if i < len(eq_lines)  else blank_eq)
+                for i in range(n_rows)
+            ]
+
+            state = "▶" if playing else "⏸"
+            vol_s = f"  vol {_local_vol}%" if _local_vol is not None else ""
+            bar_w = max(10, term_w - 14)
+
+            if audio is not None:
+                eq_src = "eq:fft"
+            elif analysis_id == track_id:
+                eq_src = "eq:api" if isinstance(analysis, dict) else "eq:sim"
+            else:
+                eq_src = "eq:…"
+
+            if status_ticks > 0: status_ticks -= 1
+            else:                status_msg = ""
+
+            out = [
+                f"{BOLD}{track}{RESET}"[:term_w],
+                f"{DIM}{artists}{RESET}"[:term_w],
+                f"{DIM}{album}{RESET}"[:term_w],
+                DIM + "─" * term_w + RESET,
+                *combined,
+                DIM + "─" * term_w + RESET,
+                progress_bar(prog_ms, dur_ms, bar_w),
+                (f"\x1b[31m⚠ {status_msg}{RESET}" if status_msg else
+                 f"{DIM}{state} {device}{vol_s}   {eq_src}   space=⏯  ←=⏮  →=⏭  ↑↓=vol  l=liked  r=recent  /=search  q=quit{RESET}"),
+            ]
+
+            # Overwrite in place — no clear-screen flash
+            buf = ["\x1b[H"]
+            for line in out:
+                buf.append(line + "\x1b[K\r\n")
+            buf.append("\x1b[J")   # erase leftover lines below
+            sys.stdout.write("".join(buf))
+            sys.stdout.flush()
+
+            # Sleep only the remaining time in the 100 ms budget
+            time.sleep(max(0.0, 0.1 - (time.time() - _t0)))
+
+    finally:
+        if audio is not None:
+            audio.close()
+        if _spotifyd_proc is not None:
+            _spotifyd_proc.terminate()
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
+        sys.stdout.write("\x1b[?25h\r\n")   # restore cursor
+        # Save playback state so 'r' can resume exactly where we left off
+        try:
+            if pb and pb.get("item"):
+                _last = {
+                    "track_uri":  pb["item"]["uri"],
+                    "track_name": pb["item"].get("name", ""),
+                    "artist":     (pb["item"].get("artists") or [{}])[0].get("name", ""),
+                    "context_uri": (pb.get("context") or {}).get("uri"),
+                    "progress_ms": pb.get("progress_ms", 0),
+                }
+                (CONFIG_DIR / "last_session.json").write_text(json.dumps(_last))
+        except Exception:
+            pass
+        # Restore BG Music's internal output then quit it
+        _bgmusic_set_output(_BG_SPEAKERS)
+        subprocess.run(["osascript", "-e", 'quit app "Background Music"'],
+                       capture_output=True, timeout=5)
+        _dbg.close()
+
+
+def _keylog():
+    """Print raw key sequences — run with --keylog to diagnose arrow keys."""
+    import os
+    old = termios.tcgetattr(sys.stdin)
+    tty.setraw(sys.stdin.fileno())
+    sys.stdout.write("Press keys (q to quit):\r\n")
+    sys.stdout.flush()
+    try:
+        while True:
+            if not select.select([sys.stdin], [], [], 0.1)[0]:
+                continue
+            ch = sys.stdin.read(1)
+            if ch == "q":
+                break
+            if ch == "\x1b":
+                rest = ""
+                for _ in range(5):
+                    if select.select([sys.stdin], [], [], 0.05)[0]:
+                        rest += sys.stdin.read(1)
+                sys.stdout.write(f"ESC seq: {repr(ch + rest)}\r\n")
+            else:
+                sys.stdout.write(f"char:    {repr(ch)}\r\n")
+            sys.stdout.flush()
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+        sys.stdout.write("\r\n")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--keylog":
+        _keylog()
+    else:
+        main()

@@ -1216,7 +1216,7 @@ def main():
             track_id = item.get("id")
 
             # ── layout dimensions ─────────────────────────────────────────────
-            avail_rows = max(4, term_h - 7)   # 4 header + 3 footer
+            avail_rows = max(4, term_h - 6)   # 3 header + 3 footer
             art_cols   = term_w // 2
             eq_cols    = term_w - art_cols
             art_rows   = min(avail_rows, art_cols // 2)
@@ -1300,8 +1300,7 @@ def main():
             else:                status_msg = ""
 
             out = [
-                f"{BOLD}{track}{RESET}"[:term_w],
-                f"{DIM}{artists}{RESET}"[:term_w],
+                (f"{BOLD}{track}{RESET}  {DIM}{artists}{RESET}")[:term_w],
                 f"{DIM}{album}{RESET}"[:term_w],
                 DIM + "─" * term_w + RESET,
                 *combined,
@@ -1313,8 +1312,9 @@ def main():
 
             # Overwrite in place — no clear-screen flash
             buf = ["\x1b[H"]
-            for line in out:
+            for line in out[:-1]:
                 buf.append(line + "\x1b[K\r\n")
+            buf.append(out[-1] + "\x1b[K")
             buf.append("\x1b[J")   # erase leftover lines below
             sys.stdout.write("".join(buf))
             sys.stdout.flush()
